@@ -1,0 +1,427 @@
+import { existsSync, statSync } from "node:fs";
+import { constants } from "node:os";
+import { resolve } from "node:path";
+import { normalizeCommands } from "./proc/args.js";
+import { runInline } from "./proc/inline.js";
+import type { MultiplexOptions, OutputRef, SupervisorRef } from "./proc/types.js";
+import {
+    fitsTui,
+    formatStreamContinuation,
+    formatStreamLabel,
+    inlineChildColumns,
+    MIN_COLUMNS,
+    MIN_ROWS,
+    sanitizeTitle,
+    systemMsg,
+} from "./proc/util.js";
+import { MultiplexApp } from "./ui/MultiplexApp.js";
+
+export { DEFAULT_COLORS } from "./proc/color.js";
+export type { CommandInput, MultiplexOptions } from "./proc/types.js";
+
+/** Extra options the OpenTUI front end owns (beyond the multiplex contract). */
+export type DevTuiOptions = MultiplexOptions & {
+    /** Synthetic output instead of spawned processes (no TTY needed). */
+    fake?: boolean;
+    fakeIntervalMs?: number;
+    theme?: string;
+};
+
+// SIGHUP/SIGQUIT do not exist on Windows; SIGBREAK (Ctrl+Break) does.
+// SIGTERM can be listened for on Windows but the OS never sends it, while
+// SIGHUP is generated when the console window is closed — so both stay out
+// of the graceful-termination path there in favour of SIGBREAK.
+const SIGNALS =
+    process.platform === "win32"
+        ? (["SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"] as const)
+        : (["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const);
+
+function positiveInt(value: number, name: string): number {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`${name} must be a positive integer, got ${value}.`);
+    }
+
+    return value;
+}
+
+function supportsColor(): boolean {
+    if (process.env.NO_COLOR) {
+        return false;
+    }
+
+    if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0") {
+        return true;
+    }
+
+    return Boolean(process.stdout.isTTY);
+}
+
+/**
+ * Whether stdin will actually enter raw mode, which is not the same question as
+ * `isTTY`. A terminal we do not own — a background process group, a pty whose
+ * other end has gone, a `/dev/tty` handed to us by a parent that kept the
+ * foreground for itself — reports itself as a TTY and then fails the ioctl with
+ * EIO. Node reports that by emitting "error" on the stream rather than throwing,
+ * so a bare try/catch never sees it and the failure surfaces as an uncaught
+ * error from inside the renderer's mount. Probing once, before anything is
+ * drawn, lets a terminal that cannot do raw mode fall back to inline output
+ * like any other terminal we cannot draw in.
+ */
+function rawModeUsable(): boolean {
+    const stdin = process.stdin;
+
+    if (typeof stdin.setRawMode !== "function") {
+        return false;
+    }
+
+    // The probe's own failure has to be listened for, or it is the same
+    // uncaught "error" event we are here to avoid.
+    let emitted = false;
+    const onError = () => {
+        emitted = true;
+    };
+
+    const wasRaw = stdin.isRaw === true;
+
+    stdin.on("error", onError);
+
+    try {
+        stdin.setRawMode(true);
+
+        // `isRaw` only moves when the ioctl succeeded, so it answers both
+        // questions: whether we got raw mode, and whether there is anything to
+        // undo. The terminal goes back the way we found it either way — a
+        // failed probe means inline mode, and inline mode wants the terminal it
+        // started with, echo and Ctrl-C included.
+        const entered = !emitted && stdin.isRaw === true;
+
+        if (stdin.isRaw !== wasRaw) {
+            stdin.setRawMode(wasRaw);
+        }
+
+        return entered;
+    } catch {
+        return false;
+    } finally {
+        stdin.removeListener("error", onError);
+    }
+}
+
+/**
+ * Installs the teardown that has to survive a signal. `process.on("exit")` does
+ * not run when we are killed by one, and on Unix the children sit in their own
+ * process groups so they never see the terminal's own SIGHUP — without these,
+ * closing the window leaves every dev server running and holding its port.
+ * (On Windows children share our console, so they see Ctrl+C directly.)
+ */
+function installTeardown(shutdown: () => Promise<void>, onExit: () => void) {
+    const handlers = SIGNALS.map((signal) => {
+        // Waits for the shutdown so the children get their chance to clean up,
+        // which is only safe because a second signal re-enters here, finds the
+        // shutdown already running and exits through onExit — SIGKILL and no
+        // waiting. Someone who wants out now presses it again.
+        const handler = () => {
+            shutdown().finally(() => {
+                process.exit(128 + (constants.signals[signal] ?? 0));
+            });
+        };
+
+        process.on(signal, handler);
+
+        return [signal, handler] as const;
+    });
+
+    process.on("exit", onExit);
+
+    return () => {
+        for (const [signal, handler] of handlers) {
+            process.removeListener(signal, handler);
+        }
+
+        process.removeListener("exit", onExit);
+    };
+}
+
+/**
+ * Runs the commands and resolves with an exit code once everything has exited
+ * and every child process is gone. Options are validated before we touch the
+ * terminal, so a bad option throws with the screen untouched.
+ *
+ * Renders the OpenTUI tabbed front end when the terminal can support it and
+ * falls back to inline output — every line printed as it arrives — when it
+ * cannot, so a pipe, a CI job, a window too small to draw a layout in or a
+ * terminal that will not give us raw mode gets usable output rather than an
+ * error.
+ */
+export async function devTui(options: DevTuiOptions): Promise<number> {
+    const commandDefs = normalizeCommands(options.commands ?? []);
+    const bufferSize = positiveInt(options.bufferSize ?? 2_000, "bufferSize");
+    const streamBufferSize = positiveInt(
+        options.streamBufferSize ?? 10_000,
+        "streamBufferSize",
+    );
+    const timestamps = options.timestamps ?? false;
+    const title = options.title ? sanitizeTitle(options.title) : undefined;
+    const json = options.json ?? false;
+    // Nothing below has to be answered for a run that was never going to draw a
+    // TUI, and `rawModeUsable` is the one that costs a terminal side effect.
+    const inlineRequested = options.inline ?? false;
+    const wantsTui = !json && !inlineRequested;
+    const hasTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    const noRawMode = wantsTui && hasTty && !rawModeUsable();
+    const interactive = hasTty && !noRawMode;
+    const columns = process.stdout.columns ?? 0;
+    const rows = process.stdout.rows ?? 0;
+    const tooSmall = wantsTui && interactive && !fitsTui(columns, rows);
+    const inline = json || inlineRequested || !interactive || tooSmall;
+
+    const cwd = resolve(options.cwd ?? process.cwd());
+
+    if (options.fake && (json || (options.inline ?? false) || !interactive || (interactive && !fitsTui(columns, rows)))) {
+        throw new Error("--fake needs an interactive terminal large enough for the TUI.");
+    }
+
+    if (!existsSync(cwd)) {
+        throw new Error(`cwd path does not exist: ${cwd}`);
+    }
+
+    if (!statSync(cwd).isDirectory()) {
+        throw new Error(`cwd path is not a directory: ${cwd}`);
+    }
+
+    const supervisorRef: SupervisorRef = { current: null };
+
+    /** SIGTERM, a grace period, then SIGKILL for anything still standing. */
+    function terminate(): Promise<void> {
+        return supervisorRef.current?.terminate() ?? Promise.resolve();
+    }
+
+    /** The synchronous last resort, for the paths that cannot wait. */
+    function killAll() {
+        supervisorRef.current?.killAll();
+    }
+
+    return inline ? runInlineMode() : runTui();
+
+    async function runInlineMode(): Promise<number> {
+        const color = !json && supportsColor();
+        const useTitle = title && !json && process.stdout.isTTY;
+
+        let shuttingDown = false;
+
+        function restoreTitle() {
+            if (!useTitle) {
+                return;
+            }
+
+            try {
+                process.stdout.write("\x1b[23;0t");
+            } catch {
+                //
+            }
+        }
+
+        async function shutdown() {
+            if (shuttingDown) {
+                return;
+            }
+
+            shuttingDown = true;
+
+            await terminate();
+
+            restoreTitle();
+        }
+
+        const uninstall = installTeardown(shutdown, () => {
+            killAll();
+            restoreTitle();
+        });
+
+        // Without a TTY inline mode is the expected outcome and needs no
+        // explanation, and neither does one that was asked for; in a real
+        // terminal the missing TUI does.
+        const notice = tooSmall
+            ? `Terminal is ${columns}x${rows}; the TUI needs at least ${MIN_COLUMNS}x${MIN_ROWS}. Running inline.`
+            : noRawMode
+              ? "Terminal will not enter raw mode, so the TUI has no keyboard input. Running inline."
+              : undefined;
+
+        if (notice) {
+            process.stderr.write(`${color ? systemMsg(notice) : notice}\n`);
+        }
+
+        if (useTitle) {
+            process.stdout.write(`\x1b[22;0t\x1b]0;${title}\x07`);
+        }
+
+        try {
+            const { done } = runInline({
+                commandDefs,
+                cwd,
+                timestamps,
+                autoRestart: options.restart ?? true,
+                json,
+                color,
+                columns: inlineChildColumns(
+                    commandDefs.map((c) => c.label),
+                    process.stdout.columns ?? 80,
+                    timestamps,
+                ),
+                supervisorRef,
+            });
+
+            const code = await done;
+
+            await shutdown();
+
+            return code;
+        } catch {
+            await shutdown();
+
+            return 1;
+        } finally {
+            uninstall();
+        }
+    }
+
+    /**
+     * The OpenTUI tabbed front end. Quitting (q / Ctrl+C) resolves the exit
+     * promise; signals and window-close go through the shared teardown so no
+     * child keeps running with its port held.
+     */
+    async function runTui(): Promise<number> {
+        const outputRef: OutputRef = { current: [] };
+        void outputRef;
+
+        let app: MultiplexApp | null = null;
+        let shuttingDown = false;
+        let titlePushed = false;
+        let resolveExit: () => void = () => {};
+        const exited = new Promise<void>((resolve) => {
+            resolveExit = resolve;
+        });
+
+        function restoreTitle() {
+            try {
+                // Guarded: restoreTerminal runs twice, and a second pop would
+                // take someone else's title off the stack.
+                if (titlePushed) {
+                    titlePushed = false;
+
+                    process.stdout.write("\x1b[23;0t");
+                }
+            } catch {
+                //
+            }
+        }
+
+        function flushOutput() {
+            const lines = app?.buffers.streamLines ?? outputRef.current;
+
+            if (lines.length === 0) {
+                return;
+            }
+
+            const maxLabelLen = Math.max(...commandDefs.map((c) => c.label.length));
+
+            try {
+                for (const sl of lines) {
+                    const cmd = commandDefs[sl.cmdIndex];
+
+                    if (!cmd) {
+                        continue;
+                    }
+
+                    const prefix = sl.cont
+                        ? formatStreamContinuation(maxLabelLen, true)
+                        : formatStreamLabel(cmd.label, cmd.color, maxLabelLen, true);
+
+                    process.stdout.write(`${sl.ts}${prefix}${sl.text}\n`);
+                }
+            } catch {
+                // The terminal can already be gone when we got here via SIGHUP.
+            }
+        }
+
+        async function shutdown() {
+            if (shuttingDown) {
+                return;
+            }
+
+            shuttingDown = true;
+
+            try {
+                // destroy() leaves the alternate screen, then waits for the
+                // children so the flush carries their exit lines.
+                await app?.destroy();
+            } catch {
+                //
+            }
+
+            restoreTitle();
+            killAll();
+            flushOutput();
+            resolveExit();
+        }
+
+        const uninstall = installTeardown(shutdown, () => {
+            killAll();
+            restoreTitle();
+        });
+
+        // The renderer toggles raw mode on mount and again on unmount, and a
+        // stdin that stops working in between reports it by emitting "error"
+        // rather than throwing. Unhandled, that ends the process where it
+        // stands — mid-frame or mid-shutdown, with the alternate screen still
+        // up and the children still running. There is nothing useful to do
+        // about input that has gone away while the TUI is up, so absorb it
+        // and let the teardown finish.
+        const ignoreStdinError = () => {};
+
+        process.stdin.on("error", ignoreStdinError);
+
+        if (title) {
+            process.stdout.write(`\x1b[22;0t\x1b]0;${title}\x07`);
+
+            titlePushed = true;
+        }
+
+        try {
+            app = await MultiplexApp.create({
+                commandDefs,
+                cwd,
+                streamMode: options.stream ?? false,
+                bufferSize,
+                streamBufferSize,
+                timestamps,
+                autoRestart: options.restart ?? true,
+                title,
+                fake: options.fake ?? false,
+                fakeIntervalMs: options.fakeIntervalMs,
+                theme: options.theme,
+                supervisorRef,
+            });
+
+            outputRef.current = app.buffers.streamLines;
+            app.onRequestExit = () => {
+                void shutdown();
+            };
+
+            await exited;
+
+            return 0;
+        } catch {
+            await shutdown();
+
+            return 1;
+        } finally {
+            process.stdin.removeListener("error", ignoreStdinError);
+
+            uninstall();
+        }
+    }
+}
+
+/** Alias kept so later `bin/cake dev` wiring can call either name. */
+export const multiplex = devTui;
