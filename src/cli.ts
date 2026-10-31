@@ -11,7 +11,7 @@ const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const program = new Command()
     .name("dev-tui")
     .description("Run multiple commands in a tabbed TUI (OpenTUI)")
-    .version("0.1.1")
+    .version("0.1.2")
     .option("--cwd <path>", "Set the working directory", process.cwd())
     .option("-s, --stream", "Start in stream mode", false)
     .option("--tabs", "Start in tabs mode (the default)", false)

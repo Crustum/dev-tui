@@ -1,6 +1,6 @@
 {
     "name": "@crustum/dev-tui",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "OpenTUI dev process runner — tabbed TUI for running multiple commands simultaneously (dev-tui, port of multiplex)",
     "keywords": [
         "tui",
