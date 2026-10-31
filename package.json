@@ -1,6 +1,6 @@
 {
     "name": "@crustum/dev-tui",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "OpenTUI dev process runner — tabbed TUI for running multiple commands simultaneously (dev-tui, port of multiplex)",
     "keywords": [
         "tui",
@@ -38,7 +38,8 @@
         "test:all": "tsx --test src/proc/*.test.ts src/tui/*.test.ts && bun test src/ui/",
         "check": "biome check --write",
         "lint": "biome lint",
-        "format": "biome format --write"
+        "format": "biome format --write",
+        "prepublishOnly": "bun run build"
     },
     "dependencies": {
         "@opentui/core": "0.5.11",
