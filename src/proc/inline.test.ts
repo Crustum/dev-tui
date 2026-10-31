@@ -13,16 +13,26 @@ const cli = fileURLToPath(new URL("../cli.ts", import.meta.url));
 // runtime the tests themselves run on. That choice is platform-neutral: the
 // entry is plain JS either way.
 //
+// Except bun on Windows, which cannot load tsx's loader there (drive-letter
+// file URLs fail its preload resolution), so the TypeScript CLI runs directly
+// instead — bun executes .ts natively.
+const directTs =
+    process.platform === "win32" && typeof process.versions.bun === "string";
+
 // stdio is piped, so none of these are a TTY and every run takes the inline
 // path — which is the point: this is what a pipe, a Makefile or CI actually get.
 function runCli(
     args: string[],
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
     return new Promise((resolve, reject) => {
-        const proc = spawn(process.execPath, [tsx, cli, ...args], {
-            stdio: ["ignore", "pipe", "pipe"],
-            env: { ...process.env, NO_COLOR: "1" },
-        });
+        const proc = spawn(
+            process.execPath,
+            directTs ? [cli, ...args] : [tsx, cli, ...args],
+            {
+                stdio: ["ignore", "pipe", "pipe"],
+                env: { ...process.env, NO_COLOR: "1" },
+            },
+        );
 
         let stdout = "";
         let stderr = "";

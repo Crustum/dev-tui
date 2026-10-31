@@ -67,8 +67,16 @@ function runWithFakeTty(
     `;
 
     return new Promise((resolve, reject) => {
-        // See inline.test.ts: .bin/tsx is not directly execable on Windows.
-        const proc = spawn(process.execPath, [tsx, "--eval", harness, "--", ...args], {
+        // See inline.test.ts: .bin/tsx is not directly execable on Windows,
+        // and bun on Windows cannot load tsx's loader at all — run the
+        // TypeScript CLI directly there, bun executes .ts natively.
+        const directTs =
+            process.platform === "win32" &&
+            typeof process.versions.bun === "string";
+        const argv = directTs
+            ? ["--eval", harness, "--", ...args]
+            : [tsx, "--eval", harness, "--", ...args];
+        const proc = spawn(process.execPath, argv, {
             stdio: ["ignore", "pipe", "pipe"],
             env: { ...process.env, NO_COLOR: "1" },
         });
