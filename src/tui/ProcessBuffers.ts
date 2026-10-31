@@ -131,13 +131,14 @@ export class ProcessBuffers {
 
                 onData({ index, chunk }) {
                     if (!self.opts.timestamps) {
+                        // Complete lines arrive separately via onLine and are
+                        // pushed there; pushing them here as well doubled every
+                        // line in the tab view. Only the incomplete tail is
+                        // tracked (live display via pendingTail, terminated by
+                        // commitPending when a system message lands).
                         const parts = (self.pending[index] + chunk).split("\n");
 
                         self.pending[index] = parts.pop() as string;
-
-                        for (const part of parts) {
-                            self.pushRows(index, wrapLine(part, self.wrapTabbed));
-                        }
                     }
 
                     onChange();
